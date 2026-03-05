@@ -1,6 +1,6 @@
 module GetExclusiveKmers
 
-using FASTX
+using FASTX, ArgParse
 
 export GetExclusiveKmers
 
@@ -82,7 +82,7 @@ function getOccursin_rolling_hash(
         error("K-mer size must be greater than the inputed sequence")
     end
 
-    base = UInt64(257)
+    base = UInt64(5)
 
     # Calculate base^(k_len-1) for rolling hash
     power = UInt64(1)
@@ -117,59 +117,142 @@ function getOccursin_rolling_hash(
 end
 
 
+function get_exclusive_kmers(
+    k_len::Int,
+    dataset_path::String,
+    use_gramep::Bool,
+    use_entropy::Bool,
+    reference::Union{Nothing,String})::Set{String}
 
-function julia_main()::Cint
+    sketch::Dict{String,Int} = generate_kmers(k_len)
 
-    # ACTG
-
-
-    # CTGA
-    # TGAC
-    # GACT
-
-
-    seqteste::Vector{String} = ["ACTGACT", "TCTGACT"]
-    k::Int = 9
-    numero_esperado = 4^k
-
-    sketch::Dict{String,Int} = gerar_kmers(k)
-
-    println("Total de k-mers esperados: $numero_esperado")
-    println("Total de k-mers gerados: ", length(sketch))
-
-    # Pressuposto - A população de sequencias possuem todos k-mers contidos
-    # A cada iteração eu tenho que filtrar meu conjunto
-    # Até acabar com as sequencias assim o que sobrar será o conjunto de k-mers exclusivo
-
-    kmer_hash_map = Dict{UInt64,String}()
+    kmer_hash_map = Dict{UInt64,Tuple{String,Int32}}()
+    kmer_reference = Dict{UInt64,Tuple{String,Int32}}() # 4^klen
 
     for kmer in keys(sketch)
         h = compute_hash(kmer)
         if !haskey(kmer_hash_map, h)
-            kmer_hash_map[h] = kmer
+            kmer_hash_map[h] = (kmer, Int32(0))
+            kmer_reference[h] = (kmer, Int32(0))
         end
     end
 
-    # @show kmer_hash_map
+    all_exclusive_kmers = Set{String}()
 
-    variantDirPath = "/home/salipe/Desktop/datasets/mkpx/data/"
+    variantDirs::Vector{String} = readdir(dataset_path)
+    variant_kmers = Dict{String,Set{String}}()
 
-    variantDirs::Vector{String} = readdir(variantDirPath)
+    # Calcular os kmers da referencia
+    if use_gramep
+        reference_var_hash = kmer_hash_map
+        reference::String = loadStringSequences(reference)[1]
+        reference_var_hash = rolling_hash_kmers(reference, reference_var_hash, k_len)
+
+        reference_kmer_dict = Dict{String,Int32}()
+        for kmer_freq in values(reference_var_hash)
+            reference_kmer_dict[kmer_freq[1]] = kmer_freq[2]
+        end
+
+        freq = max_entropy(reference_kmer_dict)
+        filter!(e -> e[2] >= freq, reference_kmer_dict)
+    end
+
 
     @inbounds for v in eachindex(variantDirs)
         variant::String = variantDirs[v]
-        println("Processing $variant")
-        # var_hash = kmer_hash_map
+        println("Getting $variant k-mers")
+        var_hash = kmer_hash_map
 
-
-        sequences::Vector{String} = loadStringSequences("$variantDirPath/$variant/$variant.fasta")
-
+        sequences::Vector{String} = loadStringSequences("$dataset_path/$variant")
         for seq in sequences
-            kmer_hash_map = getOccursin_rolling_hash(seq, kmer_hash_map, k)
+            var_hash = rolling_hash_kmers(seq, var_hash, k_len)
         end
 
-        @show length(kmer_hash_map)
+        # A busca das mais informativas tem que ser aqui em comparação com a referencia
+        kmer_dict = Dict{String,Int32}()
+        for kmer_freq in values(var_hash)
+            kmer_dict[kmer_freq[1]] = kmer_freq[2]
+        end
+
+        if length(keys(kmer_dict)) <= 1
+            error("Insufficient k-mers found!")
+        else
+            @info "Found $(length(keys(kmer_dict))) kmers for $variant"
+        end
+
+        if use_entropy
+            freq = max_entropy(kmer_dict)
+            filter!(e -> e[2] >= freq, kmer_dict)
+        elseif use_gramep
+            filter!(e -> e[2] != freq, kmer_dict)
+        end
+
+        variant_kmers[variant] = Set(keys(kmer_dict))
+
+        for kmer_values in values(var_hash)
+            union!(all_exclusive_kmers, Set([kmer_values[1]]))
+        end
+
     end
+
+    # Measure all te intersections
+    kmers_in_multiple_variants = Set{String}()
+    variant_list = collect(keys(variant_kmers))
+
+    @inbounds for i in eachindex(variant_list)
+        for j in (i+1):length(variant_list)
+            v1 = variant_list[i]
+            v2 = variant_list[j]
+            shared = intersect(variant_kmers[v1], variant_kmers[v2])
+            union!(kmers_in_multiple_variants, shared)
+        end
+    end
+
+    union_exclusive = setdiff(all_exclusive_kmers, kmers_in_multiple_variants)
+    return union_exclusive
+end
+
+
+
+function julia_main()::Cint
+
+
+    settings = ArgParseSettings(
+        description="GEK-MERS - Get Exclusive K-mers",
+        version="0.1",
+        add_version=true
+    )
+
+    @add_arg_table! settings begin
+        "-g", "--use-gramep"
+        help = "Use gramep selection"
+        action = :store_true
+        "-e", "--use-entropy"
+        help = "Use Max Entropy to select k-mers"
+        action = :store_true
+        "-k", "--k-len"
+        help = "K-mer K value"
+        required = true
+        arg_type = Int
+        "-d", "--directory"
+        help = "Dataset directory path"
+        required = true
+        arg_type = String
+        "-r", "--reference"
+        help = "Dataset directory path"
+        required = false
+    end
+
+    k_len::Int = settings["k-len"]
+    directory::String = settings["directory"]
+    use_gramep::Bool = settings["use-gramep"]
+    use_entropy::Bool = settings["use-entropy"]
+    reference::Union{Nothing,String} = settings["reference"]  # optional, may be `nothing`
+
+    numero_esperado = 4^k
+    @info "Quantidade de K-mer máximo:" numero_esperado
+
+
 
 
     return 0
