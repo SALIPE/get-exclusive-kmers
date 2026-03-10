@@ -10,7 +10,7 @@ function loadStringSequences(
 
     sequences = String[]
     for record in open(FASTAReader, file)
-        push!(sequences, sequence(String, record))
+        push!(sequences, uppercase(sequence(String, record)))
     end
     return sequences
 end
@@ -29,7 +29,7 @@ end
 
 function compute_hash(s::String)::UInt64
     h = UInt64(0)
-    base = UInt64(257)
+    base = UInt64(5)
 
     for char in s
         h = h * base + UInt64(char)
@@ -37,8 +37,6 @@ function compute_hash(s::String)::UInt64
 
     return h
 end
-
-
 
 function gerar_kmers(k::Int)
 
@@ -67,54 +65,128 @@ function gerar_kmers(k::Int)
 end
 
 
+function max_entropy(kmers::Dict{String,Int32})
+    # Extrair valores e ordenar
+    data = collect(values(kmers))
+    total = sum(data)
+    sort!(data, rev=true)
+
+    # Normalizar dados
+    normalized_data = data ./ total
 
 
-function getOccursin_rolling_hash(
+    function entropy(probs::Vector{Float64})::Float64
+        -sum(p * log(p) for p in probs if p > 0.0)
+    end
+
+    # Calcular curva de entropia 
+    entropy_curve = map(1:length(normalized_data)-1) do s
+        # Região A: probs[1:s], probabilidade total P_A
+        p_a = sum(normalized_data[1:s])
+        h_a = if p_a > 0.0
+            p_a_data = normalized_data[1:s] ./ p_a
+            entropy(p_a_data)
+        else
+            0.0
+        end
+
+        # Região B: probs[s+1:end], probabilidade total P_B
+        p_b = sum(normalized_data[s+1:end])
+        h_b = if p_b > 0.0
+            p_b_data = normalized_data[s+1:end] ./ p_b
+            entropy(p_b_data)
+        else
+            0.0
+        end
+
+        h_a + h_b
+    end
+
+    # Encontrar índice de máxima entropia
+    max_entropy_idx = argmax(entropy_curve)
+    threshold = max_entropy_idx
+    frequency = data[threshold]
+
+    return frequency
+end
+
+
+function rolling_hash_kmers(
     sequence::String,
-    kmer_hash_map::Dict{UInt64,String},
-    k_len::Int)::Dict{UInt64,String}
+    kmer_hash_map::Dict{UInt64,Tuple{String,Int32}},
+    k_len::Int)::Dict{UInt64,Tuple{String,Int32}}
 
     seq_len = length(sequence)
 
-    update_hashmap = Dict{UInt64,String}()
+    update_hashmap = Dict{UInt64,Tuple{String,Int32}}()
 
     if seq_len < k_len
         error("K-mer size must be greater than the inputed sequence")
     end
+    if length(keys(kmer_hash_map)) == 0
+        error("0 k-mers found!")
+    end
 
     base = UInt64(5)
 
-    # Calculate base^(k_len-1) for rolling hash
     power = UInt64(1)
     for i in 1:(k_len-1)
         power *= base
     end
 
-    # Calculate initial hash
+
+    # Have to init the hash
     current_hash = UInt64(0)
     @inbounds for i in 1:k_len
         current_hash = current_hash * base + UInt64(sequence[i])
     end
 
-    # Check first k-mer
     if haskey(kmer_hash_map, current_hash)
         update_hashmap[current_hash] = kmer_hash_map[current_hash]
+        kmer, value = update_hashmap[current_hash]
+        update_hashmap[current_hash] = (kmer, value + 1)
     end
 
-    # Roll through sequence
     @inbounds for i in (k_len+1):seq_len
-        # Rolling hash: remove leftmost char, add rightmost char
         current_hash = current_hash - UInt64(sequence[i-k_len]) * power
         current_hash = current_hash * base + UInt64(sequence[i])
 
+
         if haskey(kmer_hash_map, current_hash)
-            update_hashmap[current_hash] = kmer_hash_map[current_hash]
+            if haskey(update_hashmap, current_hash)
+                kmer, value = update_hashmap[current_hash]
+                update_hashmap[current_hash] = (kmer, value + 1)
+            else
+                update_hashmap[current_hash] = kmer_hash_map[current_hash]
+                kmer, value = update_hashmap[current_hash]
+                update_hashmap[current_hash] = (kmer, value + 1)
+            end
         end
     end
 
     return update_hashmap
 
 end
+
+function generate_kmers(k::Int)
+    nucleotides = ['A', 'C', 'T', 'G']
+    sketch = Dict{String,Int}()
+    function gerar_combinacoes(prefixo::String, tamanho_restante::Int)
+        if tamanho_restante == 0
+            sketch[prefixo] = 0
+            return
+        end
+
+        for nucleotide in nucleotides
+            gerar_combinacoes(prefixo * nucleotide, tamanho_restante - 1)
+        end
+    end
+
+    gerar_combinacoes("", k)
+
+    return sketch
+end
+
 
 
 function get_exclusive_kmers(
@@ -127,13 +199,11 @@ function get_exclusive_kmers(
     sketch::Dict{String,Int} = generate_kmers(k_len)
 
     kmer_hash_map = Dict{UInt64,Tuple{String,Int32}}()
-    kmer_reference = Dict{UInt64,Tuple{String,Int32}}() # 4^klen
 
     for kmer in keys(sketch)
         h = compute_hash(kmer)
         if !haskey(kmer_hash_map, h)
             kmer_hash_map[h] = (kmer, Int32(0))
-            kmer_reference[h] = (kmer, Int32(0))
         end
     end
 
@@ -144,9 +214,8 @@ function get_exclusive_kmers(
 
     # Calcular os kmers da referencia
     if use_gramep
-        reference_var_hash = kmer_hash_map
-        reference::String = loadStringSequences(reference)[1]
-        reference_var_hash = rolling_hash_kmers(reference, reference_var_hash, k_len)
+        reference_seq::String = loadStringSequences(reference)[1]
+        reference_var_hash = rolling_hash_kmers(reference_seq, kmer_hash_map, k_len)
 
         reference_kmer_dict = Dict{String,Int32}()
         for kmer_freq in values(reference_var_hash)
@@ -163,7 +232,7 @@ function get_exclusive_kmers(
         println("Getting $variant k-mers")
         var_hash = kmer_hash_map
 
-        sequences::Vector{String} = loadStringSequences("$dataset_path/$variant")
+        sequences::Vector{String} = loadStringSequences("$dataset_path/$variant/$variant.fasta")
         for seq in sequences
             var_hash = rolling_hash_kmers(seq, var_hash, k_len)
         end
@@ -180,14 +249,16 @@ function get_exclusive_kmers(
             @info "Found $(length(keys(kmer_dict))) kmers for $variant"
         end
 
-        if use_entropy
-            freq = max_entropy(kmer_dict)
-            filter!(e -> e[2] >= freq, kmer_dict)
-        elseif use_gramep
-            filter!(e -> e[2] != freq, kmer_dict)
+        freq = max_entropy(kmer_dict)
+        filter!(e -> e[2] >= freq, kmer_dict)
+
+        if use_gramep
+            filter!(e -> !haskey(reference_kmer_dict, e[2]), kmer_dict)
         end
 
         variant_kmers[variant] = Set(keys(kmer_dict))
+
+        @info "Selected $(length(keys(kmer_dict))) kmers for $variant"
 
         for kmer_values in values(var_hash)
             union!(all_exclusive_kmers, Set([kmer_values[1]]))
@@ -243,16 +314,20 @@ function julia_main()::Cint
         required = false
     end
 
-    k_len::Int = settings["k-len"]
-    directory::String = settings["directory"]
-    use_gramep::Bool = settings["use-gramep"]
-    use_entropy::Bool = settings["use-entropy"]
-    reference::Union{Nothing,String} = settings["reference"]  # optional, may be `nothing`
+    parsed_args = parse_args(settings)
 
-    numero_esperado = 4^k
+    directory::String = parsed_args["directory"]
+    k_len::Int = parsed_args["k-len"]
+    use_gramep::Bool = parsed_args["use-gramep"]
+    use_entropy::Bool = parsed_args["use-entropy"]
+    reference::Union{Nothing,String} = parsed_args["reference"]  # optional, may be `nothing`
+
+    numero_esperado = 4^k_len
     @info "Quantidade de K-mer máximo:" numero_esperado
 
+    exclusive_kmers::Set{String} = get_exclusive_kmers(k_len, directory, use_gramep, use_entropy, reference)
 
+    @info "Found $(length(exclusive_kmers)) kmers for the dataset"
 
 
     return 0
